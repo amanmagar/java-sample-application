@@ -1,0 +1,293 @@
+name: CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      version:
+        description: 'Version to deploy (defaults to latest commit)'
+        required: false
+        type: string
+
+  push:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'cicd/**'
+
+env:
+  JAVA_VERSION: '17'
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: your-ecr-repo-url
+  TF_VERSION: '1.5.7'
+  TF_WORKING_DIR: terraform/environments
+
+jobs:
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "image_tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    name: Deploy to ${{ needs.prepare.outputs.environment }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prepare.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-duration-seconds: 1200
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ needs.prepare.outputs.environment }}
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ needs.prepare.outputs.environment }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ needs.prepare.outputs.environment }}
+        run: |
+          terraform plan \
+            -var="image_tag=${{ needs.prepare.outputs.image_tag }}" \
+            -var="ecr_repository=${{ env.ECR_REPOSITORY }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}/${{ needs.prepare.outputs.environment }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Task Definition
+        id: taskdef
+        run: |
+          CLUSTER_NAME="${{ needs.prepare.outputs.environment }}-cluster"
+          SERVICE_NAME="${{ needs.prepare.outputs.environment }}-service"
+          
+          aws ecs describe-task-definition \
+            --task-definition ${SERVICE_NAME} \
+            --query 'taskDefinition.{revision:revision,family:family}' \
+            --output json > taskdef.json
+          
+          echo "revision=$(cat taskdef.json | jq -r '.revision')" >> $GITHUB_OUTPUT
+          echo "family=$(cat taskdef.json | jq -r '.family')" >> $GITHUB_OUTPUT
+
+      - name: Create Deployment Record
+        id: deployment
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name java-sample-application \
+            --deployment-group-name ${{ needs.prepare.outputs.environment }}-deployment-group \
+            --revision revisionType=String,string={s3Location={bucket=${{ needs.prepare.outputs.environment }}-deployments,key=appspec.yaml,bundleType=YAML}} \
+            --query "deploymentId" \
+            --output text)
+          
+          echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Deployment
+        run: |
+          aws deploy wait deployment-successful --deployment-id ${{ steps.deployment.outputs.deployment_id }}
+
+  verify:
+    name: Verify Deployment
+    needs: [prepare, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check ECS Service Status
+        run: |
+          CLUSTER_NAME="${{ needs.prepare.outputs.environment }}-cluster"
+          SERVICE_NAME="${{ needs.prepare.outputs.environment }}-service"
+          
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME
+          
+          STATUS=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].status' \
+            --output text)
+          
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "Service is not active. Current status: $STATUS"
+            exit 1
+          fi
+          
+          DESIRED=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].desiredCount' \
+            --output text)
+          
+          RUNNING=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].runningCount' \
+            --output text)
+          
+          if [ "$DESIRED" != "$RUNNING" ]; then
+            echo "Not all tasks are running. Desired: $DESIRED, Running: $RUNNING"
+            exit 1
+          fi
+      
+      - name: Run Health Checks
+        run: |
+          API_URL="${{ needs.prepare.outputs.environment == 'prod' ? 'https://api.example.com' : 'https://api-dev.example.com' }}"
+          
+          # Wait for application to be healthy
+          max_attempts=30
+          count=0
+          while [ $count -lt $max_attempts ]; do
+            status_code=$(curl -s -o /dev/null -w "%{http_code}" $API_URL/actuator/health)
+            if [ $status_code -eq 200 ]; then
+              echo "Service is healthy!"
+              exit 0
+            fi
+            echo "Service not yet healthy (status: $status_code), waiting..."
+            sleep 10
+            count=$((count+1))
+          done
+          
+          echo "Service failed to become healthy after $max_attempts attempts"
+          exit 1
+
+  rollback:
+    name: Rollback Deployment
+    needs: [prepare, deploy]
+    runs-on: ubuntu-latest
+    if: ${{ failure() }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Get Previous Task Definition Revision
+        id: previous-taskdef
+        run: |
+          CLUSTER_NAME="${{ needs.prepare.outputs.environment }}-cluster"
+          SERVICE_NAME="${{ needs.prepare.outputs.environment }}-service"
+          
+          # Get the current task definition
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          
+          # Extract the family and current revision
+          TASK_FAMILY=$(echo $TASK_DEF_ARN | cut -d'/' -f2 | cut -d':' -f1)
+          CURRENT_REVISION=$(echo $TASK_DEF_ARN | cut -d':' -f2)
+          
+          # Find the previous revision
+          PREVIOUS_REVISION=$((CURRENT_REVISION - 1))
+          
+          echo "task_family=$TASK_FAMILY" >> $GITHUB_OUTPUT
+          echo "previous_revision=$PREVIOUS_REVISION" >> $GITHUB_OUTPUT
+
+      - name: Rollback to Previous Task Definition
+        run: |
+          CLUSTER_NAME="${{ needs.prepare.outputs.environment }}-cluster"
+          SERVICE_NAME="${{ needs.prepare.outputs.environment }}-service"
+          
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --task-definition ${{ steps.previous-taskdef.outputs.task_family }}:${{ steps.previous-taskdef.outputs.previous_revision }} \
+            --force-new-deployment
+
+      - name: Wait for Rollback to Complete
+        run: |
+          CLUSTER_NAME="${{ needs.prepare.outputs.environment }}-cluster"
+          SERVICE_NAME="${{ needs.prepare.outputs.environment }}-service"
+          
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME
+
+      - name: Send Rollback Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: deployments
+          SLACK_COLOR: danger
+          SLACK_TITLE: Deployment Failed - Automatic Rollback Initiated
+          SLACK_MESSAGE: |
+            Deployment to ${{ needs.prepare.outputs.environment }} failed and was automatically rolled back to the previous version.
+            See details: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  notify:
+    name: Send Notification
+    needs: [prepare, deploy, verify]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check deployment status
+        id: check
+        run: |
+          if [ "${{ needs.verify.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: deployments
+          SLACK_COLOR: ${{ steps.check.outputs.color }}
+          SLACK_TITLE: Deployment to ${{ needs.prepare.outputs.environment }} ${{ steps.check.outputs.status }}
+          SLACK_MESSAGE: |
+            Deployment of version ${{ needs.prepare.outputs.image_tag }} to ${{ needs.prepare.outputs.environment }} ${{ steps.check.outputs.status }}.
+            See details: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

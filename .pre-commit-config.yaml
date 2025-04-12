@@ -1,0 +1,71 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks:
+      - id: hadolint
+        name: Lint Dockerfiles
+        description: Runs hadolint Docker image linter
+        entry: hadolint
+        language: system
+        types: [dockerfile]
+        stages: [commit]
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.77.1
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_tflint
+      - id: terraform_docs
+        args:
+          - --args=--sort-by-required
+
+  - repo: https://github.com/zricethezav/gitleaks
+    rev: v8.16.1
+    hooks:
+      - id: gitleaks
+        name: GitLeaks
+        description: Detect hardcoded secrets like passwords and tokens
+        entry: gitleaks protect --verbose --redact
+        language: system
+        stages: [commit, push]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.16.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: checkstyle
+        name: Checkstyle
+        description: Run checkstyle on Java files
+        entry: ./mvnw checkstyle:check
+        language: system
+        types: [java]
+        pass_filenames: false
+
+      - id: test
+        name: Run Tests
+        entry: ./mvnw test
+        language: system
+        types: [java]
+        pass_filenames: false
+        stages: [push]
+        
+      - id: trivy
+        name: Trivy
+        description: Run Trivy vulnerability scanner
+        entry: bash -c 'for file in $(git diff --staged --name-only | grep "Dockerfile"); do trivy config --exit-code 1 --severity HIGH,CRITICAL $file; done'
+        language: system
+        files: Dockerfile
+        pass_filenames: false
