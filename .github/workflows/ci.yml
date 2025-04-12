@@ -198,10 +198,11 @@ jobs:
     if: always()
     steps:
       - name: Check build status
+        id: workflow-conclusion-action
         uses: technote-space/workflow-conclusion-action@v3
 
       - name: Send notification
-        if: env.WORKFLOW_CONCLUSION == 'failure'
+        if: steps.workflow-conclusion-action.outputs.conclusion == 'failure'
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

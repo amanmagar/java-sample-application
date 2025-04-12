@@ -177,7 +177,11 @@ jobs:
       
       - name: Run Health Checks
         run: |
-          API_URL="${{ needs.prepare.outputs.environment == 'prod' ? 'https://api.example.com' : 'https://api-dev.example.com' }}"
+          if [ "${{ needs.prepare.outputs.environment }}" == "prod" ]; then
+            API_URL="https://api.example.com"
+          else
+            API_URL="https://api-dev.example.com"
+          fi
           
           # Wait for application to be healthy
           max_attempts=30
